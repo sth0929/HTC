@@ -24,7 +24,7 @@
       box-sizing: border-box;
     }
 
-    #drawBtn {
+    .tool-btn {
       padding: 4px 12px;
       border-radius: 4px;
       border: 2px solid #2962FF;
@@ -38,25 +38,47 @@
       -webkit-tap-highlight-color: transparent;
       touch-action: manipulation;
     }
-    #drawBtn.active {
+    .tool-btn.active {
       background: #2962FF;
       color: white;
+    }
+    #measureBtn {
+      border-color: #e67e00;
+      color: #e67e00;
+    }
+    #measureBtn.active {
+      background: #e67e00;
+      color: white;
+      border-color: #e67e00;
+    }
+    #clearMeasureBtn {
+      border-color: #999;
+      color: #999;
+      display: none;
+    }
+    #clearMeasureBtn.visible {
+      display: inline-block;
     }
 
     #toolHint {
       color: #999;
       font-size: 11px;
+      flex: 1;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
     }
 
     #chart {
       width: 100%;
-      /* 기본: 차트 스크롤/핀치줌 허용 */
       touch-action: pan-x pan-y pinch-zoom;
     }
-
-    /* 그리기 모드: 브라우저 터치 동작 전부 차단 */
     #chart.draw-mode {
       touch-action: none;
+    }
+    #chart.measure-mode {
+      touch-action: none;
+      cursor: crosshair !important;
     }
 
     #priceTooltip {
@@ -71,22 +93,58 @@
       z-index: 9999;
       white-space: nowrap;
     }
+
+    #measurePopup {
+      position: absolute;
+      pointer-events: none;
+      display: none;
+      z-index: 9998;
+      transform: translate(-50%, -100%);
+      margin-top: -8px;
+    }
+    #measurePopup .bubble {
+      background: rgba(230, 126, 0, 0.92);
+      color: white;
+      padding: 5px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: bold;
+      white-space: nowrap;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      line-height: 1.6;
+      text-align: center;
+    }
+    #measurePopup .bubble::after {
+      content: "";
+      display: block;
+      width: 0;
+      height: 0;
+      border-left: 7px solid transparent;
+      border-right: 7px solid transparent;
+      border-top: 7px solid rgba(230, 126, 0, 0.92);
+      margin: 0 auto;
+    }
   </style>
 </head>
 <body>
 
 <div id="toolbar">
-  <button id="drawBtn" onclick="toggleDrawMode()">✏️ 지지선 그리기</button>
-  <span id="toolHint">클릭: 추가 &nbsp;|&nbsp; 드래그: 이동 &nbsp;|&nbsp; 더블클릭: 삭제</span>
+  <button id="drawBtn"         class="tool-btn" onclick="toggleDrawMode()">✏️ 지지선</button>
+  <button id="measureBtn"      class="tool-btn" onclick="toggleMeasureMode()">📏 가격 폭</button>
+  <button id="clearMeasureBtn" class="tool-btn" onclick="clearMeasure()">✕ 폭 지우기</button>
+  <span   id="toolHint">모드를 선택하세요</span>
 </div>
 
 <div id="chart"></div>
 <div id="priceTooltip"></div>
+<div id="measurePopup"><div class="bubble" id="measureBubbleText"></div></div>
 
 <script>
   const data        = __CANDLE_DATA__;
   const supportInit = __SUPPORT_LINES__;
   const markers     = __MARKER_DATA__;
+  const fitContent  = __FIT_CONTENT__;
+  const entryPrice  = __ENTRY_PRICE__;
 
   if (typeof LightweightCharts === "undefined") {
     document.body.innerHTML = "<h2>❌ LightweightCharts 로딩 실패</h2>";
@@ -96,11 +154,6 @@
     const chartEl   = document.getElementById("chart");
     chartEl.style.height = (window.innerHeight - TOOLBAR_H) + "px";
 
-    // =====================
-    // 차트 생성
-    // fixLeftEdge / fixRightEdge / lockVisibleTimeRangeOnResize 제거
-    // → 마우스 휠 줌 + 핀치줌 + 드래그 이동 자유롭게 가능
-    // =====================
     const chart = LightweightCharts.createChart(chartEl, {
       layout: { background: { color: "#ffffff" } },
       grid: {
@@ -115,8 +168,8 @@
         rightOffset: 5
       },
       crosshair: { mode: 0 },
-      handleScroll: true,   // 기본: 스크롤 허용
-      handleScale: true     // 기본: 줌 허용
+      handleScroll: true,
+      handleScale: true
     });
 
     // 캔들
@@ -147,42 +200,46 @@
       }))
     );
 
+    // 진입가 수평 실선 (노란색)
+    if (entryPrice && entryPrice > 0) {
+      const entrySeries = chart.addLineSeries({
+        color: "#f0b400",
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        priceLineVisible: false,
+        lastValueVisible: true,
+        crosshairMarkerVisible: false,
+        title: "ENTRY",
+      });
+      entrySeries.setData(data.map(d => ({ time: d.time, value: entryPrice })));
+    }
+
     // =====================
     // 줌/스크롤 상태 유지
-    // localStorage에 visibleRange 저장 → 다음 캔들 후에도 복원
     // =====================
-    const RANGE_KEY = "chart_visible_range";
-
     function saveRange() {
       try {
         const range = chart.timeScale().getVisibleRange();
-        if (range) localStorage.setItem(RANGE_KEY, JSON.stringify(range));
+        if (range) window.parent._chartSavedRange = range;
       } catch(e) {}
     }
-
-    function restoreRange() {
-      try {
-        const saved = localStorage.getItem(RANGE_KEY);
-        if (saved) {
-          const range = JSON.parse(saved);
-          // 저장된 범위가 현재 데이터 범위 안에 있는지 확인
-          const firstTime = data[0].time;
-          const lastTime  = data[data.length - 1].time;
-          if (range.from >= firstTime && range.to <= lastTime + 86400) {
-            chart.timeScale().setVisibleRange(range);
-            return true;
-          }
-        }
-      } catch(e) {}
-      return false;
-    }
-
     requestAnimationFrame(() => {
-      const restored = restoreRange();
-      if (!restored) chart.timeScale().fitContent();
+      if (fitContent) {
+        chart.timeScale().fitContent();
+        window.parent._chartSavedRange = null;
+      } else {
+        try {
+          const saved = window.parent._chartSavedRange;
+          if (saved) {
+            chart.timeScale().setVisibleRange(saved);
+          } else {
+            chart.timeScale().fitContent();
+          }
+        } catch(e) {
+          chart.timeScale().fitContent();
+        }
+      }
     });
-
-    // 차트 범위가 바뀔 때마다 저장
     chart.timeScale().subscribeVisibleTimeRangeChange(saveRange);
 
     // =====================
@@ -195,43 +252,34 @@
 
     const tooltip = document.getElementById("priceTooltip");
 
+    function setHint(msg) {
+      document.getElementById("toolHint").textContent = msg;
+    }
+
     function toggleDrawMode() {
+      if (measureMode) toggleMeasureMode();
+
       drawMode = !drawMode;
       document.getElementById("drawBtn").classList.toggle("active", drawMode);
+      chart.applyOptions({ handleScroll: !drawMode, handleScale: !drawMode });
 
       if (drawMode) {
-        // 그리기 모드 ON → 차트 스크롤/줌 끄기
-        chart.applyOptions({ handleScroll: false, handleScale: false });
         chartEl.classList.add("draw-mode");
+        chartEl.classList.remove("measure-mode");
         chartEl.style.cursor = "crosshair";
+        setHint("클릭: 추가  |  드래그: 이동  |  더블클릭: 삭제");
       } else {
-        // 그리기 모드 OFF → 차트 스크롤/줌 다시 켜기
-        chart.applyOptions({ handleScroll: true, handleScale: true });
         chartEl.classList.remove("draw-mode");
         chartEl.style.cursor = "default";
         dragging = null;
         hideTooltip();
+        setHint("모드를 선택하세요");
       }
     }
 
-    window.addEventListener("message", (e) => {
-      if (e.data && e.data.type === "SET_SUPPORT_MODE") {
-        drawMode = e.data.enabled;
-        document.getElementById("drawBtn").classList.toggle("active", drawMode);
-        chart.applyOptions({
-          handleScroll: !drawMode,
-          handleScale: !drawMode
-        });
-      }
-    });
-
-    // =====================
-    // 지지선 추가/삭제/업데이트
-    // =====================
     function addSupportLine(price) {
       const id    = Date.now() + Math.random();
       const times = data.map(d => d.time);
-
       const series = chart.addLineSeries({
         color: "#2962FF",
         lineWidth: 2,
@@ -242,7 +290,6 @@
         title: "",
       });
       series.setData(times.map(t => ({ time: t, value: price })));
-
       supportLines.push({ id, price, series });
       syncToStreamlit();
       return id;
@@ -264,6 +311,12 @@
       line.series.setData(times.map(t => ({ time: t, value: newPrice })));
     }
 
+    function clearAllSupportLines() {
+      supportLines.forEach(l => chart.removeSeries(l.series));
+      supportLines = [];
+    }
+
+    clearAllSupportLines();
     supportInit.forEach(s => addSupportLine(s.price));
 
     function syncToStreamlit() {
@@ -276,6 +329,154 @@
     }
 
     // =====================
+    // 📏 가격 폭 측정 도구
+    // =====================
+    let measureMode     = false;
+    let measureDragging = false;
+    let measurePriceA   = null;
+    let measureLineA    = null;
+    let measureLineB    = null;
+    let measureStartY   = null;
+
+    const measurePopup      = document.getElementById("measurePopup");
+    const measureBubbleText = document.getElementById("measureBubbleText");
+
+    function toggleMeasureMode() {
+      if (drawMode) toggleDrawMode();
+
+      measureMode = !measureMode;
+      document.getElementById("measureBtn").classList.toggle("active", measureMode);
+      chart.applyOptions({ handleScroll: !measureMode, handleScale: !measureMode });
+
+      if (measureMode) {
+        chartEl.classList.add("measure-mode");
+        chartEl.classList.remove("draw-mode");
+        setHint("시작 지점을 누른 채로 드래그 → 손 떼면 확정");
+        clearMeasure();
+        measureMode = true;
+        document.getElementById("measureBtn").classList.add("active");
+      } else {
+        chartEl.classList.remove("measure-mode");
+        chartEl.style.cursor = "default";
+        measureDragging = false;
+        measurePriceA   = null;
+        hideTooltip();
+        setHint("모드를 선택하세요");
+      }
+    }
+
+    function clearMeasure() {
+      measurePriceA   = null;
+      measureDragging = false;
+      if (measureLineA) { chart.removeSeries(measureLineA); measureLineA = null; }
+      if (measureLineB) { chart.removeSeries(measureLineB); measureLineB = null; }
+      measurePopup.style.display = "none";
+      document.getElementById("clearMeasureBtn").classList.remove("visible");
+      if (measureMode) setHint("시작 지점을 누른 채로 드래그 → 손 떼면 확정");
+    }
+
+    function drawMeasureLine(price, color, dash) {
+      const times = data.map(d => d.time);
+      const s = chart.addLineSeries({
+        color: color,
+        lineWidth: 2,
+        lineStyle: dash ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Solid,
+        priceLineVisible: false,
+        lastValueVisible: true,
+        crosshairMarkerVisible: false,
+        title: price.toFixed(2),
+      });
+      s.setData(times.map(t => ({ time: t, value: price })));
+      return s;
+    }
+
+    function updateMeasureLine(series, price) {
+      const times = data.map(d => d.time);
+      series.setData(times.map(t => ({ time: t, value: price })));
+      series.applyOptions({ title: price.toFixed(2) });
+    }
+
+    function showMeasurePopup(priceA, priceB, clientX, clientY) {
+      const pct    = ((priceB - priceA) / priceA) * 100;
+      const absPct = Math.abs(pct);
+      const arrow  = pct >= 0 ? "📈" : "📉";
+      const sign   = pct >= 0 ? "+" : "";
+
+      measureBubbleText.innerHTML =
+        `${arrow} ${priceA.toFixed(2)} → ${priceB.toFixed(2)}<br>` +
+        `<span style="font-size:15px;">${sign}${pct.toFixed(2)}%&nbsp;(${absPct.toFixed(2)}%)</span>`;
+
+      const rect = chartEl.getBoundingClientRect();
+      const yA   = candleSeries.priceToCoordinate(priceA);
+      const yB   = candleSeries.priceToCoordinate(priceB);
+      const midY = (yA !== null && yB !== null) ? (yA + yB) / 2 : (clientY - rect.top);
+      const midX = clientX - rect.left;
+
+      measurePopup.style.display = "block";
+      measurePopup.style.left    = midX + "px";
+      measurePopup.style.top     = (midY - 4) + "px";
+    }
+
+    function handleMeasureDown(clientX, clientY) {
+      const price = yToPrice(clientY);
+      if (!price || price <= 0) return;
+
+      clearMeasure();
+      measureMode     = true;
+      document.getElementById("measureBtn").classList.add("active");
+      chart.applyOptions({ handleScroll: false, handleScale: false });
+
+      measurePriceA   = price;
+      measureDragging = true;
+      measureStartY   = clientY;
+
+      if (measureLineA) chart.removeSeries(measureLineA);
+      measureLineA = drawMeasureLine(price, "#e67e00", false);
+
+      setHint("드래그 중… 손을 떼면 확정");
+    }
+
+    function handleMeasureMove(clientX, clientY) {
+      if (!measureDragging || measurePriceA === null) return;
+
+      const price = yToPrice(clientY);
+      if (!price || price <= 0) return;
+
+      if (measureLineB) {
+        updateMeasureLine(measureLineB, price);
+      } else {
+        measureLineB = drawMeasureLine(price, "#e67e00", true);
+      }
+
+      showMeasurePopup(measurePriceA, price, clientX, clientY);
+    }
+
+    function handleMeasureUp(clientX, clientY) {
+      if (!measureDragging || measurePriceA === null) return;
+
+      const price = yToPrice(clientY);
+      measureDragging = false;
+
+      if (!price || price <= 0 || Math.abs(price - measurePriceA) < 0.01) {
+        clearMeasure();
+        setHint("시작 지점을 누른 채로 드래그 → 손 떼면 확정");
+        return;
+      }
+
+      if (measureLineB) {
+        updateMeasureLine(measureLineB, price);
+      } else {
+        measureLineB = drawMeasureLine(price, "#e67e00", true);
+      }
+
+      showMeasurePopup(measurePriceA, price, clientX, clientY);
+      document.getElementById("clearMeasureBtn").classList.add("visible");
+      setHint("드래그로 재측정  |  ✕ 로 지우기");
+
+      measurePriceA = null;
+    }
+
+    // =====================
     // 좌표 변환 유틸
     // =====================
     function yToPrice(clientY) {
@@ -284,16 +485,13 @@
     }
 
     function getClientPos(e) {
-      if (e.touches && e.touches.length > 0) {
+      if (e.touches && e.touches.length > 0)
         return { x: e.touches[0].clientX, y: e.touches[0].clientY };
-      }
-      if (e.changedTouches && e.changedTouches.length > 0) {
+      if (e.changedTouches && e.changedTouches.length > 0)
         return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
-      }
       return { x: e.clientX, y: e.clientY };
     }
 
-    // 가까운 지지선 탐색 (터치: ±16px, 마우스: ±8px)
     function findNearLine(clientY, tolerance) {
       tolerance = tolerance || 8;
       const rect = chartEl.getBoundingClientRect();
@@ -312,16 +510,22 @@
 
     // =====================
     // 공통 포인터 핸들러
-    // 그리기 모드 OFF면 차트 기본 동작(스크롤/줌)에 맡김
     // =====================
     function handlePointerDown(e, isTouch) {
+      const pos = getClientPos(e);
+
+      if (measureMode) {
+        handleMeasureDown(pos.x, pos.y);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
       if (!drawMode) return;
 
-      const pos  = getClientPos(e);
       const now  = Date.now();
       const near = findNearLine(pos.y, isTouch ? 16 : 8);
 
-      // 더블탭/더블클릭 → 삭제
       if (now - lastClickT < 300 && near) {
         removeSupportLine(near.id);
         hideTooltip();
@@ -340,7 +544,6 @@
         return;
       }
 
-      // 빈 곳 탭/클릭 → 새 지지선 추가
       const price = yToPrice(pos.y);
       if (price && price > 0) addSupportLine(price);
       e.preventDefault();
@@ -348,27 +551,32 @@
     }
 
     function handlePointerMove(e, isTouch) {
-      if (!drawMode) return;
-
       const pos = getClientPos(e);
+
+      if (measureMode) {
+        handleMeasureMove(pos.x, pos.y);
+        if (e.cancelable) { e.preventDefault(); e.stopPropagation(); }
+        return;
+      }
+
+      if (!drawMode) return;
 
       if (dragging) {
         const price = yToPrice(pos.y);
         if (price && price > 0) {
           updateSupportLine(dragging.id, price);
-          showTooltip(pos.x, pos.y, price);
+          showTooltip(pos.x, pos.y, price.toFixed(2));
         }
         e.preventDefault();
         e.stopPropagation();
         return;
       }
 
-      // 마우스 호버 커서/툴팁
       if (!isTouch) {
         const near = findNearLine(pos.y, 8);
         if (near) {
           chartEl.style.cursor = "ns-resize";
-          showTooltip(pos.x, pos.y, near.price);
+          showTooltip(pos.x, pos.y, near.price.toFixed(2));
         } else {
           chartEl.style.cursor = "crosshair";
           hideTooltip();
@@ -377,8 +585,16 @@
     }
 
     function handlePointerUp(e, isTouch) {
-      if (!drawMode) return;
+      const pos = getClientPos(e);
 
+      if (measureMode) {
+        handleMeasureUp(pos.x, pos.y);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
+      if (!drawMode) return;
       if (dragging) {
         syncToStreamlit();
         dragging = null;
@@ -396,25 +612,25 @@
     chartEl.addEventListener("mousemove",  (e) => handlePointerMove(e, false));
     chartEl.addEventListener("mouseup",    (e) => handlePointerUp(e, false));
     chartEl.addEventListener("mouseleave", () => {
+      if (measureMode && measureDragging) {
+        measureDragging = false;
+        measurePriceA   = null;
+        setHint("시작 지점을 누른 채로 드래그 → 손 떼면 확정");
+      }
       if (dragging) { syncToStreamlit(); dragging = null; }
       hideTooltip();
     });
 
     // =====================
     // 터치 이벤트 (모바일)
-    // passive: false → preventDefault() 사용 가능
     // =====================
     chartEl.addEventListener("touchstart", (e) => {
-      // 두 손가락 핀치: 그리기 모드에서도 통과시킴 (선 드래그 중엔 무시)
-      if (e.touches.length >= 2) {
-        dragging = null;
-        return;
-      }
+      if (e.touches.length >= 2) { dragging = null; return; }
       handlePointerDown(e, true);
     }, { passive: false });
 
     chartEl.addEventListener("touchmove", (e) => {
-      if (e.touches.length >= 2) return; // 핀치줌은 차트에 맡김
+      if (e.touches.length >= 2) return;
       handlePointerMove(e, true);
     }, { passive: false });
 
@@ -423,6 +639,10 @@
     }, { passive: false });
 
     chartEl.addEventListener("touchcancel", () => {
+      if (measureMode && measureDragging) {
+        measureDragging = false;
+        measurePriceA   = null;
+      }
       if (dragging) { syncToStreamlit(); dragging = null; }
       hideTooltip();
     });
@@ -430,11 +650,11 @@
     // =====================
     // 툴팁
     // =====================
-    function showTooltip(x, y, price) {
+    function showTooltip(x, y, text) {
       tooltip.style.display = "block";
       tooltip.style.left    = (x + 14) + "px";
       tooltip.style.top     = (y - 10) + "px";
-      tooltip.textContent   = price.toFixed(2);
+      tooltip.textContent   = text;
     }
     function hideTooltip() {
       tooltip.style.display = "none";
@@ -449,7 +669,7 @@
       chart.applyOptions({ width: chartEl.clientWidth, height: h });
     });
 
-  }
+  } // end LightweightCharts check
 </script>
 </body>
 </html>
