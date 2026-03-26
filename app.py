@@ -48,7 +48,7 @@ if st.session_state.USER_ID is None:
 USER_ID = st.session_state.USER_ID
 
 # =====================
-# SESSION_ID: 유저별 현재 게임 세션
+# SESSION_ID
 # =====================
 if "SESSION_ID" not in st.session_state:
     res = (
@@ -83,7 +83,8 @@ defaults = {
     "entry_price": None,
     "entry_capital": 0.0,
     "entry_time": None,
-    "leverage": 5,
+    "entry_balance": 1000.0,
+    "leverage": 20,
     "position_ratio": 0.05,
     "trade_count": 0,
     "win": 0,
@@ -104,36 +105,15 @@ defaults = {
     "pending_entry": None,
     "pending_exits": [],
     "support_draw_mode": False,
-    "turn_ended": False
+    "turn_ended": False,
+    "price_range_result": None,
+    "accumulated_pnl": 0.0,
+    "chart_fit_content": True,
 }
 
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
-# =====================
-# 앱 시작 시 성과 복원
-# =====================
-def restore_performance():
-    df = load_trade_log_df()
-    if not df.empty:
-        st.session_state.trade_count = int(df["trade_id"].max())
-        st.session_state.win = int((df["pnl_dollar"] > 0).sum())
-        st.session_state.lose = int((df["pnl_dollar"] <= 0).sum())
-        st.session_state.total_pnl = float(df["pnl_dollar"].sum())
-        st.session_state.balance = float(df.iloc[-1]["balance_after"])
-        st.session_state.trade_markers = [
-            {
-                "time": int(pd.to_datetime(r["entry_time"]).timestamp()),
-                "label": r["direction"],
-                "color": "green" if r["pnl_dollar"]>0 else "red",
-                "symbol": "arrow"
-            } for _, r in df.iterrows()
-        ]
-
-
-
-
 
 # =====================
 # 유틸 함수
@@ -147,39 +127,43 @@ def to_iso(dt):
 def save_trade_log(row: dict):
     row["session_id"] = SESSION_ID
     row["user_id"] = USER_ID
-    supabase.table("trade_log").insert(row).execute()
+    try:
+        supabase.table("trade_log").insert(row).execute()
+    except Exception as e:
+        st.error(f"❌ DB 저장 실패\n\n**에러:** {e}\n\n**데이터:** {row}")
+        raise
 
 def load_trade_log_df():
-    # user_id 기준으로 전체 누적 데이터 로드
     res = supabase.table("trade_log").select("*").eq("user_id", USER_ID).order("trade_id").execute()
     return pd.DataFrame(res.data) if res.data else pd.DataFrame()
 
 def load_session_trade_log_df():
-    # 현재 세션 데이터만 (성과 초기화용)
     res = supabase.table("trade_log").select("*").eq("session_id", SESSION_ID).order("trade_id").execute()
     return pd.DataFrame(res.data) if res.data else pd.DataFrame()
 
 def restore_performance():
     if st.session_state.performance_loaded:
         return
-    df = load_trade_log_df()
+    df = load_session_trade_log_df()
     if not df.empty:
-        st.session_state.trade_count = int(df["trade_id"].max())
-        st.session_state.win = int((df["pnl_dollar"] > 0).sum())
-        st.session_state.lose = int((df["pnl_dollar"] <= 0).sum())
         st.session_state.total_pnl = float(df["pnl_dollar"].sum())
         st.session_state.balance = float(df.iloc[-1]["balance_after"])
+        grouped = df.groupby("entry_time")["pnl_dollar"].sum()
+        st.session_state.trade_count = len(grouped)
+        st.session_state.win  = int((grouped > 0).sum())
+        st.session_state.lose = int((grouped <= 0).sum())
     st.session_state.performance_loaded = True
 
-# =====================
-# 앱 시작 시 성과 복원 호출
-# =====================
+if st.session_state.get("_new_game_balance") is not None:
+    st.session_state.balance = st.session_state["_new_game_balance"]
+    del st.session_state["_new_game_balance"]
+
 restore_performance()
 
 # =====================
 # 차트 데이터 로드
 # =====================
-def generate_chart():
+def generate_chart(timeframe="4h"):
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_FILE = os.path.join(BASE_DIR, "btc_1h.csv")
     df = pd.read_csv(DATA_FILE)
@@ -190,13 +174,22 @@ def generate_chart():
     df = df.dropna(subset=["open_time"])
     df = df.sort_values("open_time")
     df.set_index("open_time", inplace=True)
+    if timeframe == "1D":
+        df = df.resample("1D").agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum"
+        }).dropna()
     return df
 
+if "timeframe" not in st.session_state:
+    st.session_state.timeframe = "4H"
+
 if st.session_state.df_chart is None:
-    st.session_state.df_chart = generate_chart()
-    st.session_state.start_idx = random.randint(0, len(st.session_state.df_chart) - 300)
-    st.session_state.current_step = 300
-    
+    st.session_state.df_chart = generate_chart(st.session_state.timeframe)
+    lookback = 100 if st.session_state.timeframe == "1D" else 300
+    max_start = max(0, len(st.session_state.df_chart) - lookback - 50)
+    st.session_state.start_idx = random.randint(0, max_start)
+    st.session_state.current_step = lookback
 
 # =====================
 # 포지션 관련 함수
@@ -205,71 +198,60 @@ def reset_position():
     st.session_state.position = None
     st.session_state.entry_price = None
     st.session_state.entry_capital = 0
+    st.session_state.initial_capital = 0.0
     st.session_state.entry_time = None
     st.session_state.stop_loss_price = None
+    st.session_state.entry_balance = st.session_state.balance
+    st.session_state.pending_exits = []
+    st.session_state.accumulated_pnl = 0.0
 
 def open_position(pos, price, capital, leverage, position_ratio):
     st.session_state.position = pos
     st.session_state.entry_price = price
     st.session_state.entry_capital = capital
+    st.session_state.initial_capital = capital
     st.session_state.leverage = leverage
     st.session_state.position_ratio = position_ratio
-
-    # ✅ 현재 캔들의 시간 (고정)
+    st.session_state.entry_balance = st.session_state.balance
     row = st.session_state.df_chart.iloc[
         st.session_state.start_idx + st.session_state.current_step - 1
     ]
     entry_time = int(row.name.timestamp())
-
     st.session_state.entry_time = entry_time
-
     st.session_state.trade_markers.append({
-        "time": entry_time,   # ✅ 캔들 time
+        "time": entry_time,
         "label": pos,
         "color": "green" if pos == "LONG" else "red",
         "symbol": "arrow"
     })
 
 def close_position(exit_price, reason="MANUAL EXIT", ratio=1.0):
-    """
-    ratio: 청산 비율 (0.25 = 25%, 0.5 = 50%, 1.0 = 100%)
-    부분청산 시 남은 자본으로 포지션을 유지합니다.
-    """
     if st.session_state.position is None:
         return
-
     exit_ts = int(
         st.session_state.df_chart.iloc[
             st.session_state.start_idx + st.session_state.current_step - 1
         ].name.timestamp()
     )
-
     entry = st.session_state.entry_price
     total_amt = st.session_state.entry_capital
     pos = st.session_state.position
     lev = st.session_state.leverage
-
-    # 이번에 청산할 자본
     close_amt = total_amt * ratio
-
     pnl = ((exit_price - entry) / entry * close_amt * lev
            if pos == "LONG"
            else (entry - exit_price) / entry * close_amt * lev)
-
     st.session_state.balance += pnl
     st.session_state.total_pnl += pnl
-
-    # 승/패는 전체 청산(또는 강제청산)일 때만 카운트
+    st.session_state.accumulated_pnl += pnl
     is_full_close = (ratio >= 1.0) or (reason in ("LIQUIDATION", "TIMEOUT EXIT"))
     if is_full_close:
+        final_pnl = st.session_state.accumulated_pnl
         st.session_state.trade_count += 1
-        st.session_state.win += int(pnl > 0)
-        st.session_state.lose += int(pnl <= 0)
-
+        st.session_state.win  += int(final_pnl > 0)
+        st.session_state.lose += int(final_pnl <= 0)
     save_trade_log({
-        "entry_time": datetime.utcfromtimestamp(
-            st.session_state.entry_time
-        ).isoformat(),
+        "entry_time": datetime.utcfromtimestamp(st.session_state.entry_time).isoformat(),
         "exit_time": datetime.utcfromtimestamp(exit_ts).isoformat(),
         "play_hours": (exit_ts - st.session_state.entry_time) / 3600,
         "direction": pos,
@@ -282,7 +264,6 @@ def close_position(exit_price, reason="MANUAL EXIT", ratio=1.0):
         "balance_after": st.session_state.balance,
         "reason": reason
     })
-
     st.session_state.trade_markers.append({
         "time": exit_ts,
         "price": exit_price,
@@ -290,152 +271,166 @@ def close_position(exit_price, reason="MANUAL EXIT", ratio=1.0):
         "color": "red" if pnl < 0 else "green",
         "symbol": "x"
     })
-
     if is_full_close:
-        # 전체 청산 -> 포지션 완전히 종료
         reset_position()
     else:
-        # 부분청산 -> 남은 자본으로 포지션 유지
-        remaining_amt = total_amt * (1.0 - ratio)
-        st.session_state.entry_capital = remaining_amt
+        st.session_state.entry_capital = total_amt * (1.0 - ratio)
 
 # =====================
-# 강제청산 체크 함수
+# 강제청산 체크 (자동손절 제거)
 # =====================
 def check_liquidation(row):
-    """
-    캔들의 고가/저가를 이용해 강제청산(청산가 터치) 여부를 확인합니다.
-    강제청산 가격 = 진입가 ± (진입가 / 레버리지)  → 증거금 100% 손실 시점
-    """
     if st.session_state.position is None:
         return False
-
     entry = st.session_state.entry_price
     lev   = st.session_state.leverage
     pos   = st.session_state.position
-
-    # 청산가 계산 (수수료 무시, 증거금 100% 소진 기준)
     if pos == "LONG":
         liq_price = entry * (1 - 1 / lev)
         if float(row["low"]) <= liq_price:
             close_position(liq_price, reason="LIQUIDATION")
             return True
-    else:  # SHORT
+    else:
         liq_price = entry * (1 + 1 / lev)
         if float(row["high"]) >= liq_price:
             close_position(liq_price, reason="LIQUIDATION")
             return True
-
     return False
+
+# =====================
+# 롱/숏별 통계
+# =====================
+def get_direction_stats():
+    df = load_session_trade_log_df()
+    if df.empty:
+        return {}
+    result = {}
+    for direction in ["LONG", "SHORT"]:
+        sub = df[df["direction"] == direction]
+        if sub.empty:
+            result[direction] = None
+            continue
+        grp_pnl     = sub.groupby("entry_time")["pnl_dollar"].sum()
+        grp_capital = sub.groupby("entry_time")["entry_capital"].sum()
+        total    = len(grp_pnl)
+        wins     = int((grp_pnl > 0).sum())
+        winrate  = wins / total * 100
+        avg_ret  = (grp_pnl / grp_capital * 100).mean()
+        total_pnl = grp_pnl.sum()
+        result[direction] = {
+            "total": total, "wins": wins,
+            "winrate": winrate, "avg_ret": avg_ret, "total_pnl": total_pnl,
+        }
+    return result
+
+def get_trade_return_stats():
+    df = load_session_trade_log_df()
+    if df.empty:
+        return 0.0, 0.0, 0.0
+    grp_pnl     = df.groupby("entry_time")["pnl_dollar"].sum()
+    grp_capital = df.groupby("entry_time")["entry_capital"].sum()
+    grp_ret     = grp_pnl / grp_capital * 100
+    overall_avg = float(grp_ret.mean())
+    win_avg     = float(grp_ret[grp_ret > 0].mean())  if (grp_ret > 0).any()  else 0.0
+    loss_avg    = float(grp_ret[grp_ret <= 0].mean()) if (grp_ret <= 0).any() else 0.0
+    return overall_avg, win_avg, loss_avg
 
 # =====================
 # 메인 UI
 # =====================
 st.title("📈 Trading Simulator")
-
-# =====================
-# ➡️ 다음 캔들 (차트보다 먼저!)
-# =====================
 MAX_TURNS = 50
 
 # =====================
-# ⏱ 턴 종료 처리
+# 턴 종료 처리
 # =====================
 if st.session_state.turn_count >= MAX_TURNS:
-
-    # 🔒 턴 종료 플래그 초기화
     if "turn_ended" not in st.session_state:
         st.session_state.turn_ended = False
-
-    # 🔴 포지션 강제 청산 (단 1회)
     if not st.session_state.turn_ended and st.session_state.position is not None:
         row = st.session_state.df_chart.iloc[
             st.session_state.start_idx + st.session_state.current_step - 1
         ]
-        final_price = float(row["close"])
-
-        close_position(
-            final_price,
-            reason="TIMEOUT EXIT"
-        )
-
-        # ✅ 청산 완료 후 성과 갱신을 위해 플래그 초기화
+        close_position(float(row["close"]), reason="TIMEOUT EXIT")
         st.session_state.performance_loaded = False
         restore_performance()
-
-    st.session_state.turn_ended = True  # 중복 청산 방지
-
+    st.session_state.turn_ended = True
     st.warning("🛑 최대 50턴이 종료되었습니다.")
-
-    # 🔁 새 매매 시작
     if st.button("🔁 새 매매 시작"):
-        st.session_state.start_idx = random.randint(
-            0, len(st.session_state.df_chart) - 300
-        )
-        st.session_state.current_step = 300
+        _lookback = 100 if st.session_state.timeframe == "1D" else 300
+        _max_start = max(0, len(st.session_state.df_chart) - _lookback - 50)
+        st.session_state.start_idx = random.randint(0, _max_start)
+        st.session_state.current_step = _lookback
         st.session_state.turn_count = 0
         st.session_state.pending_entry = None
         st.session_state.trade_markers = []
-
-        # 🔄 상태 초기화
+        st.session_state.support_levels = []
+        st.session_state.resistance_levels = []
+        st.session_state.price_range_result = None
         reset_position()
         st.session_state.turn_ended = False
-
+        st.query_params.clear()
         st.rerun()
-
 else:
-    # ▶️ Next Candle 버튼
-    if st.button("▶️ Next Candle", key="next_candle"):
+    _col_empty, _col_turns, _col_btn = st.columns([4, 2, 1])
+    with _col_turns:
+        st.markdown(
+            f"<div style='text-align:right; padding-top:6px; color:#888; font-size:13px;'>⏳ 남은 턴: <b>{MAX_TURNS - st.session_state.turn_count}</b> / {MAX_TURNS}</div>",
+            unsafe_allow_html=True
+        )
+    with _col_btn:
+        next_clicked = st.button("▶ Next", key="next_candle", use_container_width=True)
+
+    if next_clicked:
         st.session_state.current_step += 1
         st.session_state.turn_count += 1
+        target_idx = st.session_state.start_idx + st.session_state.current_step - 1
+        if target_idx >= len(st.session_state.df_chart):
+            st.warning("⚠️ 데이터 끝에 도달했습니다. 새 게임을 시작해주세요.")
+            st.stop()
+        row = st.session_state.df_chart.iloc[target_idx]
 
-        # 📌 지정가 진입 체크
         if st.session_state.pending_entry is not None:
-            row = st.session_state.df_chart.iloc[
-                st.session_state.start_idx + st.session_state.current_step - 1
-            ]
-
             limit_price = st.session_state.pending_entry["price"]
-            direction = st.session_state.pending_entry["dir"]
-
-            hit = False
-            if direction == "LONG" and row["low"] <= limit_price:
-                hit = True
-            if direction == "SHORT" and row["high"] >= limit_price:
-                hit = True
-
+            direction   = st.session_state.pending_entry["dir"]
+            hit = (direction == "LONG" and row["low"] <= limit_price) or \
+                  (direction == "SHORT" and row["high"] >= limit_price)
             if hit:
-                open_position(
-                    direction,
-                    limit_price,
-                    st.session_state.balance * st.session_state.position_ratio,
-                    st.session_state.leverage,
-                    st.session_state.position_ratio
-                )
+                open_position(direction, limit_price,
+                              st.session_state.balance * st.session_state.position_ratio,
+                              st.session_state.leverage, st.session_state.position_ratio)
                 st.session_state.pending_entry = None
 
-        # 🔴 강제청산 체크 (지정가 진입 후 포함)
-        row = st.session_state.df_chart.iloc[
-            st.session_state.start_idx + st.session_state.current_step - 1
-        ]
+        if st.session_state.position is not None and st.session_state.pending_exits:
+            remaining = []
+            for ex in st.session_state.pending_exits:
+                hit = (st.session_state.position == "LONG"  and row["high"] >= ex["price"]) or \
+                      (st.session_state.position == "SHORT" and row["low"]  <= ex["price"])
+                if hit and st.session_state.position is not None:
+                    close_position(ex["price"], reason=f"LIMIT EXIT ({ex['label']})", ratio=ex["ratio"])
+                else:
+                    remaining.append(ex)
+            st.session_state.pending_exits = remaining
+
         liquidated = check_liquidation(row)
         if liquidated:
-            st.session_state.pending_entry = None  # 지정가 주문도 취소
+            st.session_state.pending_entry = None
+            st.session_state.pending_exits = []
 
         st.rerun()
+
 # =====================
 # 데이터 슬라이싱
 # =====================
 start = st.session_state.start_idx
-end = start + st.session_state.current_step
+end   = start + st.session_state.current_step
 df_view = st.session_state.df_chart.iloc[start:end]
 current_price = df_view["close"].iloc[-1]
 
 # =====================
-# 📩 JS → Streamlit: 지지선 전체 목록 수신
+# JS → Streamlit: 지지선 수신
 # =====================
 params = st.query_params
-
 if "support_all" in params:
     raw = params["support_all"]
     if isinstance(raw, list):
@@ -447,9 +442,7 @@ if "support_all" in params:
         pass
     st.query_params.clear()
     st.rerun()
-
 elif "support_price" in params:
-    # 기존 단건 방식 호환
     price = float(params["support_price"][0] if isinstance(params["support_price"], list) else params["support_price"])
     if price not in st.session_state.support_levels:
         st.session_state.support_levels.append(price)
@@ -457,133 +450,135 @@ elif "support_price" in params:
     st.rerun()
 
 # =====================
-# 차트표시
+# 차트 표시
 # =====================
-# HTML/JS 차트 렌더링
 df_reset = df_view.reset_index()
-
 candles = df_reset.apply(
     lambda r: {
-        "time": int(pd.to_datetime(r["open_time"]).timestamp()),
-        "open": float(r["open"]),
-        "high": float(r["high"]),
-        "low": float(r["low"]),
-        "close": float(r["close"]),
+        "time":   int(pd.to_datetime(r["open_time"]).timestamp()),
+        "open":   float(r["open"]),
+        "high":   float(r["high"]),
+        "low":    float(r["low"]),
+        "close":  float(r["close"]),
         "volume": float(r.get("volume", 0))
-    },
-    axis=1
+    }, axis=1
 ).tolist()
 
 markers = [
     {
-        "time": m["time"],   # ✅ 그대로 사용
+        "time":     m["time"],
         "position": "belowBar" if m["label"] == "LONG" else "aboveBar",
-        "color": m["color"],
-        "shape": "arrowUp" if m["label"] == "LONG" else "arrowDown",
-        "text": m["label"]
+        "color":    m["color"],
+        "shape":    "arrowUp" if m["label"] == "LONG" else "arrowDown",
+        "text":     m["label"]
     } for m in st.session_state.trade_markers
 ]
 
-# =====================
-# 📐 지지선 JS 데이터 생성 (⭐ 여기!)
-# =====================
-support_lines_js = [
-    {"price": float(p)} for p in st.session_state.support_levels
-]
+support_lines_js = [{"price": float(p)} for p in st.session_state.support_levels]
+
+entry_price_val = float(st.session_state.entry_price) if st.session_state.entry_price else 0.0
 
 html_template = open("chart.html", encoding="utf-8").read()
+html_template = html_template.replace("__CANDLE_DATA__",     json.dumps(candles))
+html_template = html_template.replace("__MARKER_DATA__",     json.dumps(markers))
+html_template = html_template.replace("__SUPPORT_LINES__",   json.dumps(support_lines_js))
+html_template = html_template.replace("__AUTO_STOP_PRICE__", json.dumps(0.0))
+html_template = html_template.replace("__ENTRY_PRICE__",     json.dumps(entry_price_val))
+html_template = html_template.replace("__FIT_CONTENT__",     "true" if st.session_state.get("chart_fit_content", True) else "false")
+st.session_state.chart_fit_content = False
 
-html_template = html_template.replace("__CANDLE_DATA__", json.dumps(candles))
-html_template = html_template.replace("__MARKER_DATA__", json.dumps(markers))
-html_template = html_template.replace("__SUPPORT_LINES__", json.dumps(support_lines_js))
-
-components.html(html_template, height=620)
-
-# ----------------------
-# 남은 턴수 표시
-# ----------------------
-st.markdown(
-    f"⏳ 남은 턴수: <span style='color:blue;font-weight:bold;'>{MAX_TURNS - st.session_state.turn_count}</span> / {MAX_TURNS}",
-    unsafe_allow_html=True
-)
-
-restore_performance()
+components.html(html_template, height=420)
 
 # ----------------------
-# 포지션 손익 계산 및 표시 (레버리지 반영)
+# 포지션 손익 표시
 # ----------------------
 if st.session_state.position is not None:
     entry = st.session_state.entry_price
-    amt = st.session_state.entry_capital
-    lev = st.session_state.leverage
+    amt   = st.session_state.entry_capital
+    lev   = st.session_state.leverage
 
-    if st.session_state.position == "LONG":
-        price_change = (current_price - entry) / entry
-    else:
-        price_change = (entry - current_price) / entry
-
+    price_change      = (current_price - entry) / entry if st.session_state.position == "LONG" else (entry - current_price) / entry
     pnl_leveraged_pct = price_change * lev * 100
-    profit_leveraged = amt * price_change * lev
-
-    # 청산가 계산
-    if st.session_state.position == "LONG":
-        liq_price = entry * (1 - 1 / lev)
-    else:
-        liq_price = entry * (1 + 1 / lev)
+    profit_leveraged  = amt * price_change * lev
+    liq_price         = entry * (1 - 1/lev) if st.session_state.position == "LONG" else entry * (1 + 1/lev)
 
     st.markdown(f"""
-    ### 📊 현재 포지션
-    - 포지션: **{st.session_state.position}**
-    - 진입가: **{entry:,.2f}**
-    - 현재가: **{current_price:,.2f}**
-    - 🚨 강제청산가: <span style="color:orange;font-weight:bold;">{liq_price:,.2f}</span>
-    - 진입 금액: **${amt:,.2f}**
-    - 레버리지: **{lev}x**
-    - 손익률 (레버리지):
-      <span style="color:{'green' if pnl_leveraged_pct >= 0 else 'red'};">
-      **{pnl_leveraged_pct:+.2f}%**
-      </span>
-    - 예상 수익 (레버리지):
-      <span style="color:{'green' if profit_leveraged >= 0 else 'red'};">
-      **${profit_leveraged:+,.2f}**
-      </span>
-    """, unsafe_allow_html=True)
-
+### 📊 현재 포지션
+- 포지션: **{st.session_state.position}**
+- 진입가: **{entry:,.2f}**
+- 현재가: **{current_price:,.2f}**
+- 🚨 강제청산가: <span style="color:orange;font-weight:bold;">{liq_price:,.2f}</span>
+- 진입 금액: **${amt:,.2f}**
+- 레버리지: **{lev}x**
+- 손익률 (레버리지): <span style="color:{'green' if pnl_leveraged_pct >= 0 else 'red'};"> **{pnl_leveraged_pct:+.2f}%** </span>
+- 예상 수익 (레버리지): <span style="color:{'green' if profit_leveraged >= 0 else 'red'};"> **${profit_leveraged:+,.2f}** </span>
+""", unsafe_allow_html=True)
 
 # =====================
-# 🔧 사이드바
+# 사이드바
 # =====================
-# 유저 정보 + 로그아웃
 st.sidebar.markdown(f"👤 **{USER_ID}** 님")
 if st.sidebar.button("🚪 로그아웃", use_container_width=True):
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     st.rerun()
 st.sidebar.divider()
+
+# 레버리지
 st.sidebar.subheader("⚙️ 거래 설정")
-st.sidebar.info("레버리지: **20x** (고정)")
-st.session_state.leverage = 20
+lev_options = [5, 10, 15, 20]
+current_lev = st.session_state.leverage if st.session_state.leverage in lev_options else 20
+lev_index   = lev_options.index(current_lev)
+is_in_position = st.session_state.position is not None
 
-# =====================
-# 🔧 💰 진입 비중(사이드바)
-# =====================
-st.sidebar.subheader("💰 진입 비중")
-
-ratio_choice = st.sidebar.radio(
-    "잔고 대비 진입 비중",
-    options=["5%", "10%"],
-    index=0 if st.session_state.position_ratio <= 0.05 else 1,
-    horizontal=True
+st.session_state.leverage = st.sidebar.radio(
+    "레버리지", options=lev_options, index=lev_index,
+    format_func=lambda x: f"{x}x", horizontal=True,
+    key="leverage_radio", disabled=is_in_position
 )
+if is_in_position:
+    st.sidebar.caption("⚠️ 포지션 보유 중 레버리지 변경 불가")
+st.sidebar.info(f"레버리지: **{st.session_state.leverage}x**")
+
+# 타임프레임
+st.sidebar.subheader("📊 타임프레임")
+tf_choice = st.sidebar.radio("캔들 기준", options=["4H", "1D"],
+                              index=0 if st.session_state.timeframe == "4H" else 1, horizontal=True)
+if tf_choice != st.session_state.timeframe:
+    cur_last_time = None
+    if st.session_state.df_chart is not None:
+        cur_end_idx = st.session_state.start_idx + st.session_state.current_step - 1
+        if cur_end_idx < len(st.session_state.df_chart):
+            cur_last_time = st.session_state.df_chart.index[cur_end_idx]
+    st.session_state.timeframe = tf_choice
+    new_df   = generate_chart(tf_choice)
+    st.session_state.df_chart = new_df
+    lookback = 100 if tf_choice == "1D" else 300
+    if cur_last_time is not None and cur_last_time in new_df.index:
+        new_end_pos = new_df.index.get_loc(cur_last_time)
+    elif cur_last_time is not None:
+        new_end_pos = min(new_df.index.searchsorted(cur_last_time), len(new_df) - 1)
+    else:
+        new_end_pos = lookback - 1
+    new_start = max(0, new_end_pos - lookback + 1)
+    if new_start + lookback + 50 > len(new_df):
+        new_start = max(0, len(new_df) - lookback - 50)
+    st.session_state.start_idx    = new_start
+    st.session_state.current_step = lookback
+    st.session_state.price_range_result = None
+    st.session_state.chart_fit_content  = True
+    st.query_params.clear()
+    st.rerun()
+
+# 진입 비중
+st.sidebar.subheader("💰 진입 비중")
+ratio_choice = st.sidebar.radio("잔고 대비 진입 비중", options=["5%", "10%"],
+                                 index=0 if st.session_state.position_ratio <= 0.05 else 1, horizontal=True)
 st.session_state.position_ratio = 0.05 if ratio_choice == "5%" else 0.10
 
-# =====================
-# 📏 지지선 (사이드바)
-# =====================
+# 지지선
 st.sidebar.subheader("📏 지지선")
 st.sidebar.caption("차트에서 ✏️ 버튼으로 그리기 모드 활성화 후\n클릭으로 추가 · 드래그로 이동 · 더블클릭으로 삭제")
-
-# 현재 등록된 지지선 목록 + 삭제 버튼
 if st.session_state.support_levels:
     st.sidebar.divider()
     st.sidebar.caption("🟦 지지선 목록")
@@ -596,145 +591,133 @@ if st.session_state.support_levels:
 else:
     st.sidebar.info("등록된 지지선 없음")
 
-# =====================
-# 📌 지정가 진입 (사이드바)
-# =====================
+# 지정가 진입
 st.sidebar.subheader("📌 지정가 진입")
 limit_price = st.sidebar.number_input("지정가 가격", value=0.0, step=1.0)
-limit_dir = st.sidebar.selectbox("방향", ["LONG", "SHORT"])
-
-col1, col2 = st.sidebar.columns(2)
+limit_dir   = st.sidebar.selectbox("방향", ["LONG", "SHORT"])
+col1, col2  = st.sidebar.columns(2)
 if col1.button("지정가 진입"):
-    st.session_state.pending_entry = {
-        "price": limit_price,
-        "dir": limit_dir
-    }
-
+    st.session_state.pending_entry = {"price": limit_price, "dir": limit_dir}
 if col2.button("지정가 취소"):
     st.session_state.pending_entry = None
-
-# =====================
-# ✅ 지정가 대기 상태 표시
-# =====================
 if st.session_state.pending_entry:
-    st.sidebar.info(
-        f"📌 지정가 대기중\n"
-        f"가격: {st.session_state.pending_entry['price']}\n"
-        f"방향: {st.session_state.pending_entry['dir']}"
-    )
+    st.sidebar.info(f"📌 지정가 대기중\n가격: {st.session_state.pending_entry['price']}\n방향: {st.session_state.pending_entry['dir']}")
 else:
     st.sidebar.info("📌 지정가 대기 없음")
 
-
-# =====================
-# 즉시 진입(사이드바)
-# =====================
+# 즉시 진입
 st.sidebar.subheader("🚀 즉시 진입")
-
 if st.session_state.position is None:
     capital = st.session_state.balance * st.session_state.position_ratio
-
     if st.sidebar.button("🟢 LONG 진입"):
-        open_position(
-            "LONG",
-            current_price,
-            capital,
-            st.session_state.leverage,
-            st.session_state.position_ratio
-        )
+        open_position("LONG", current_price, capital, st.session_state.leverage, st.session_state.position_ratio)
         st.rerun()
-
     if st.sidebar.button("🔴 SHORT 진입"):
-        open_position(
-            "SHORT",
-            current_price,
-            capital,
-            st.session_state.leverage,
-            st.session_state.position_ratio
-        )
+        open_position("SHORT", current_price, capital, st.session_state.leverage, st.session_state.position_ratio)
         st.rerun()
 else:
     st.sidebar.success(f"보유 포지션: {st.session_state.position}")
 
-# =====================
-# 진입후 포지션 청산 (사이드바)
-# =====================
+# 포지션 청산
 if st.session_state.position:
     st.sidebar.subheader("📤 포지션 청산")
-
     if st.sidebar.button("25% 청산"):
         close_position(current_price, "25% EXIT", ratio=0.25)
         st.rerun()
-
     if st.sidebar.button("50% 청산"):
         close_position(current_price, "50% EXIT", ratio=0.5)
         st.rerun()
-
     if st.sidebar.button("전체 청산"):
         close_position(current_price, "FULL EXIT", ratio=1.0)
         st.rerun()
-# ===============================
-# 🔁 성과 초기화 + 새 매매 시작 버튼(사이드바)
-# ===============================
-if st.sidebar.button("🔄 새 게임 시작"):
 
-    # 1️⃣ 새 세션 ID 생성 (기존 누적 데이터는 보존)
+    st.sidebar.markdown("---")
+    st.sidebar.caption("📌 지정가 청산 예약")
+    exit_price_input = st.sidebar.number_input("청산 지정가", value=float(current_price), step=1.0, key="exit_limit_price")
+    exit_ratio_choice = st.sidebar.radio("청산 비중", ["25%", "50%", "100%"], horizontal=True, key="exit_ratio_radio")
+    exit_ratio_map = {"25%": 0.25, "50%": 0.5, "100%": 1.0}
+    if st.sidebar.button("✅ 지정가 청산 예약"):
+        st.session_state.pending_exits.append({
+            "price": exit_price_input,
+            "ratio": exit_ratio_map[exit_ratio_choice],
+            "label": exit_ratio_choice
+        })
+        st.rerun()
+    if st.session_state.pending_exits:
+        st.sidebar.caption("🕐 지정가 청산 대기 목록")
+        for i, ex in enumerate(st.session_state.pending_exits):
+            col1, col2 = st.sidebar.columns([3, 1])
+            col1.write(f"{ex['price']:,.2f} ({ex['label']})")
+            if col2.button("❌", key=f"del_exit_{i}"):
+                st.session_state.pending_exits.pop(i)
+                st.rerun()
+    else:
+        st.sidebar.info("📌 지정가 청산 대기 없음")
+
+# 새 게임
+st.sidebar.divider()
+if st.sidebar.button("🔄 새 게임 시작"):
     new_session_id = str(uuid.uuid4())
     st.session_state.SESSION_ID = new_session_id
     SESSION_ID = new_session_id
-
     supabase.table("session_meta").insert({
-        "session_id": new_session_id,
-        "user_id": USER_ID,
-        "is_active": True,
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "session_id": new_session_id, "user_id": USER_ID,
+        "is_active": True, "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
-
-    # 2️⃣ 랜덤 차트 시작 위치 초기화
-    st.session_state.start_idx = random.randint(
-        0, len(st.session_state.df_chart) - 300
-    )
-    st.session_state.current_step = 300
-    st.session_state.turn_count = 0
-    st.session_state.pending_entry = None
-    st.session_state.pending_exits = []
-    st.session_state.trade_markers = []
+    lookback  = 100 if st.session_state.timeframe == "1D" else 300
+    max_start = max(0, len(st.session_state.df_chart) - lookback - 50)
+    st.session_state.start_idx    = random.randint(0, max_start)
+    st.session_state.current_step = lookback
+    st.session_state.turn_count   = 0
+    st.session_state.pending_entry  = None
+    st.session_state.pending_exits  = []
+    st.session_state.trade_markers  = []
     st.session_state.support_levels = []
     st.session_state.resistance_levels = []
+    st.session_state.price_range_result = None
     st.session_state.turn_ended = False
-
-    # 3️⃣ 포지션 초기화
+    st.query_params.clear()
     reset_position()
-
-    # 4️⃣ 이번 게임 성과만 초기화 (누적은 유지)
-    st.session_state.balance = 1000.0
+    st.session_state.balance  = 1000.0
     st.session_state.total_pnl = 0.0
     st.session_state.trade_count = 0
-    st.session_state.win = 0
+    st.session_state.win  = 0
     st.session_state.lose = 0
-    st.session_state.performance_loaded = False
-
+    st.session_state.performance_loaded = True
+    st.session_state.chart_fit_content  = True
     st.rerun()
 
 # =====================
-# 🔹 누적 성과 표시 (확장판)
+# 누적 성과
 # =====================
 total_trades = st.session_state.win + st.session_state.lose
 winrate = (st.session_state.win / total_trades * 100) if total_trades else 0
-
-# 📊 매매 평균 수익률 계산 (전체 / 승 / 패)
-def get_trade_return_stats():
-    df = load_trade_log_df()
-    if df.empty:
-        return 0.0, 0.0, 0.0
-    # 수익률 계산
-    df["return_pct"] = df["pnl_dollar"] / df["entry_capital"] * 100
-    overall_avg = df["return_pct"].mean()
-    win_avg = df[df["return_pct"] > 0]["return_pct"].mean() if not df[df["return_pct"] > 0].empty else 0.0
-    loss_avg = df[df["return_pct"] <= 0]["return_pct"].mean() if not df[df["return_pct"] <= 0].empty else 0.0
-    return overall_avg, win_avg, loss_avg
-
 avg_return, win_avg_return, loss_avg_return = get_trade_return_stats()
+dir_stats = get_direction_stats()
+long_s  = dir_stats.get("LONG")
+short_s = dir_stats.get("SHORT")
+
+if long_s:
+    long_block = f"""
+#### 🟢 LONG
+- 매매 수: {long_s['total']}건 &nbsp; (승 {long_s['wins']} / 패 {long_s['total'] - long_s['wins']})
+- 승률: {long_s['winrate']:.1f}%
+- 평균 수익률: <span style="color:{'green' if long_s['avg_ret'] >= 0 else 'red'};">{long_s['avg_ret']:+.2f}%</span>
+- 누적 손익: <span style="color:{'green' if long_s['total_pnl'] >= 0 else 'red'};">${long_s['total_pnl']:+,.2f}</span>
+"""
+else:
+    long_block = "#### 🟢 LONG\n- 기록 없음"
+
+if short_s:
+    short_block = f"""
+#### 🔴 SHORT
+- 매매 수: {short_s['total']}건 &nbsp; (승 {short_s['wins']} / 패 {short_s['total'] - short_s['wins']})
+- 승률: {short_s['winrate']:.1f}%
+- 평균 수익률: <span style="color:{'green' if short_s['avg_ret'] >= 0 else 'red'};">{short_s['avg_ret']:+.2f}%</span>
+- 누적 손익: <span style="color:{'green' if short_s['total_pnl'] >= 0 else 'red'};">${short_s['total_pnl']:+,.2f}</span>
+"""
+else:
+    short_block = "#### 🔴 SHORT\n- 기록 없음"
 
 st.markdown(f"""
 ## 📊 누적 성과
@@ -744,8 +727,12 @@ st.markdown(f"""
 - 매매 평균 수익률: {avg_return:+.2f}%
 - 🟢 승리 트레이드 평균 수익률: {win_avg_return:+.2f}%
 - 🔴 패배 트레이드 평균 손실률: {loss_avg_return:+.2f}%
-""")
 
-# 잔고 및 총 손익 표시
+---
+{long_block}
+
+{short_block}
+""", unsafe_allow_html=True)
+
 st.metric("잔고", f"${st.session_state.balance:,.2f}")
 st.metric("총 손익", f"${st.session_state.total_pnl:,.2f}")
